@@ -7,8 +7,11 @@ const handlesStoreName = "handles";
 const batchStoreName = "batches";
 const boardProjectStoreName = "board_projects";
 
+let cachedDbPromise: Promise<IDBDatabase> | null = null;
+
 const openDB = (): Promise<IDBDatabase> => {
-  return new Promise((resolve, reject) => {
+  if (cachedDbPromise) return cachedDbPromise;
+  cachedDbPromise = new Promise((resolve, reject) => {
     const request = indexedDB.open(dbName, 6);
     request.onupgradeneeded = (e) => {
       const db = (e.target as IDBOpenDBRequest).result;
@@ -28,9 +31,23 @@ const openDB = (): Promise<IDBDatabase> => {
         db.createObjectStore(boardProjectStoreName);
       }
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result;
+      db.onversionchange = () => {
+        db.close();
+        cachedDbPromise = null;
+      };
+      resolve(db);
+    };
+    request.onerror = () => {
+      cachedDbPromise = null;
+      reject(request.error);
+    };
+    request.onblocked = () => {
+      console.warn("IndexedDB open blocked");
+    };
   });
+  return cachedDbPromise;
 };
 
 export const saveFileHandle = async (projectId: string, handle: any) => {
@@ -63,7 +80,39 @@ export const loadFileHandle = async (projectId: string): Promise<any | null> => 
   }
 };
 
+async function getOPFSVideosDir(): Promise<FileSystemDirectoryHandle | null> {
+  if (typeof navigator !== 'undefined' && navigator.storage && navigator.storage.getDirectory) {
+    try {
+      const root = await navigator.storage.getDirectory();
+      return await root.getDirectoryHandle('tacstem_videos', { create: true });
+    } catch (e) {
+      console.warn("[OPFS] Directory handle error:", e);
+    }
+  }
+  return null;
+}
+
 export const saveVideoLocally = async (id: string, file: File) => {
+  let savedToOPFS = false;
+
+  // 1. Primary: Save to OPFS (Origin Private File System)
+  try {
+    const dir = await getOPFSVideosDir();
+    if (dir) {
+      const fileHandle = await dir.getFileHandle(`${id}.mp4`, { create: true });
+      if ('createWritable' in fileHandle) {
+        const writable = await (fileHandle as any).createWritable();
+        await writable.write(file);
+        await writable.close();
+        savedToOPFS = true;
+        console.log(`[Storage] Saved video ${id} (${file.name}) to OPFS successfully.`);
+      }
+    }
+  } catch (e) {
+    console.warn("[Storage] OPFS save failed, falling back to IndexedDB:", e);
+  }
+
+  // 2. Backup: Save to IndexedDB
   try {
     const db = await openDB();
     return new Promise<void>((resolve, reject) => {
@@ -71,14 +120,38 @@ export const saveVideoLocally = async (id: string, file: File) => {
       const store = tx.objectStore(storeName);
       store.put(file, id);
       tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
+      tx.onerror = () => {
+        if (savedToOPFS) resolve();
+        else reject(tx.error);
+      };
     });
   } catch (e) {
-    console.error("Local video save error:", e);
+    if (!savedToOPFS) {
+      console.error("Local video save error:", e);
+    }
   }
 };
 
 export const loadVideoLocally = async (id: string): Promise<File | null> => {
+    // 1. Check OPFS first (instant, high performance)
+    try {
+      const dir = await getOPFSVideosDir();
+      if (dir) {
+        try {
+          const fileHandle = await dir.getFileHandle(`${id}.mp4`, { create: false });
+          const file = await fileHandle.getFile();
+          if (file && file.size > 0) {
+            return file;
+          }
+        } catch {
+          // Not found in OPFS
+        }
+      }
+    } catch (e) {
+      console.warn("[Storage] OPFS load error:", e);
+    }
+
+    // 2. Fallback to IndexedDB
     try {
         const db = await openDB();
         return new Promise<File | null>((resolve, reject) => {
@@ -94,9 +167,26 @@ export const loadVideoLocally = async (id: string): Promise<File | null> => {
 };
 
 export const getAllStoredVideoIds = async (): Promise<string[]> => {
+    const ids = new Set<string>();
+
+    // 1. OPFS keys
+    try {
+      const dir = await getOPFSVideosDir();
+      if (dir) {
+        for await (const name of (dir as any).keys()) {
+          if (typeof name === 'string') {
+            ids.add(name.replace(/\.mp4$/i, ''));
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("[Storage] OPFS keys error:", e);
+    }
+
+    // 2. IndexedDB keys
     try {
         const db = await openDB();
-        return new Promise<string[]>((resolve, reject) => {
+        const idbKeys = await new Promise<string[]>((resolve, reject) => {
             const tx = db.transaction(storeName, "readonly");
             const store = tx.objectStore(storeName);
             const request = store.getAllKeys();
@@ -106,12 +196,25 @@ export const getAllStoredVideoIds = async (): Promise<string[]> => {
             };
             request.onerror = () => reject(request.error);
         });
-    } catch {
-        return [];
-    }
+        idbKeys.forEach(k => ids.add(k));
+    } catch {}
+
+    return Array.from(ids);
 };
 
 export const hasVideoLocally = async (id: string): Promise<boolean> => {
+    // Check OPFS
+    try {
+      const dir = await getOPFSVideosDir();
+      if (dir) {
+        try {
+          await dir.getFileHandle(`${id}.mp4`, { create: false });
+          return true;
+        } catch {}
+      }
+    } catch {}
+
+    // Check IndexedDB
     try {
         const db = await openDB();
         return new Promise<boolean>((resolve, reject) => {
@@ -139,6 +242,22 @@ export const requestPersistentStorage = async (): Promise<boolean> => {
 };
 
 export const saveProjectDataLocally = async (id: string, data: any) => {
+    // 1. Save to localStorage for instant backup & fallback
+    try {
+        const existingRaw = localStorage.getItem('tacstem_projects');
+        let projList: any[] = existingRaw ? JSON.parse(existingRaw) : [];
+        const idx = projList.findIndex((p: any) => p.id === id);
+        if (idx >= 0) {
+            projList[idx] = data;
+        } else {
+            projList.push(data);
+        }
+        localStorage.setItem('tacstem_projects', JSON.stringify(projList));
+    } catch (e) {
+        console.warn("localStorage project save backup error:", e);
+    }
+
+    // 2. Save to IndexedDB
     try {
         const db = await openDB();
         return new Promise<void>((resolve, reject) => {
@@ -154,21 +273,69 @@ export const saveProjectDataLocally = async (id: string, data: any) => {
 };
 
 export const listProjectsLocally = async (): Promise<any[]> => {
+    let idbProjects: any[] = [];
     try {
         const db = await openDB();
-        return new Promise<any[]>((resolve, reject) => {
+        idbProjects = await new Promise<any[]>((resolve, reject) => {
             const tx = db.transaction(projectStoreName, "readonly");
             const store = tx.objectStore(projectStoreName);
             const request = store.getAll();
             request.onsuccess = () => resolve(request.result || []);
             request.onerror = () => reject(request.error);
         });
-    } catch {
-        return [];
+    } catch (e) {
+        console.warn("IndexedDB listProjects error:", e);
     }
+
+    let lsProjects: any[] = [];
+    try {
+        const raw = localStorage.getItem('tacstem_projects');
+        if (raw) lsProjects = JSON.parse(raw);
+    } catch (e) {
+        console.warn("localStorage listProjects error:", e);
+    }
+
+    // Merge IndexedDB and localStorage projects by ID (latest modified wins)
+    const map = new Map<string, any>();
+    for (const p of lsProjects) {
+        if (p && p.id) map.set(p.id, p);
+    }
+    for (const p of idbProjects) {
+        if (p && p.id) {
+            const existing = map.get(p.id);
+            if (!existing || (p.lastModified || 0) >= (existing.lastModified || 0)) {
+                map.set(p.id, p);
+            }
+        }
+    }
+
+    const merged = Array.from(map.values());
+    if (merged.length > 0) {
+        try {
+            localStorage.setItem('tacstem_projects', JSON.stringify(merged));
+        } catch {}
+    }
+    return merged;
 };
 
 export const deleteProjectLocally = async (id: string) => {
+    try {
+        const dir = await getOPFSVideosDir();
+        if (dir) {
+            try {
+                await dir.removeEntry(`${id}.mp4`);
+            } catch {}
+        }
+    } catch {}
+
+    try {
+        const raw = localStorage.getItem('tacstem_projects');
+        if (raw) {
+            const filtered = JSON.parse(raw).filter((p: any) => p.id !== id);
+            localStorage.setItem('tacstem_projects', JSON.stringify(filtered));
+        }
+    } catch {}
+
     try {
         const db = await openDB();
         return new Promise<void>((resolve, reject) => {

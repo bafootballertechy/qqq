@@ -147,7 +147,7 @@ export async function convertWebmToMp4(
 
   try {
     const source = new BlobSource(webmBlob);
-    const input = new Input({ source });
+    const input = new Input({ source, formats: [] as any });
     const target = new BufferTarget();
     const output = new Output({
       target,

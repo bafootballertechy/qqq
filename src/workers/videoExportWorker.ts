@@ -193,7 +193,7 @@ self.onmessage = async (e: MessageEvent) => {
           self.postMessage({ type: 'CONVERSION_PROGRESS', percent: 5 });
 
           const source = new BlobSource(fullBlob);
-          const input = new Input({ source });
+          const input = new Input({ source, formats: [] as any });
           const target = new BufferTarget();
           const output = new Output({
             target,

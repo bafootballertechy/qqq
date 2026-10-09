@@ -12,7 +12,7 @@ self.onmessage = async (e: MessageEvent) => {
 
       const sourceBlob = new Blob([buffer], { type: mimeType || 'video/webm' });
       const source = new BlobSource(sourceBlob);
-      const input = new Input({ source });
+      const input = new Input({ source, formats: [] as any });
       const target = new BufferTarget();
       const output = new Output({
         target,
@@ -40,7 +40,7 @@ self.onmessage = async (e: MessageEvent) => {
       }
 
       // Transfer the buffer back to main thread with zero copy
-      self.postMessage(
+      (self.postMessage as any)(
         { type: 'SUCCESS', buffer: outputBuffer },
         [outputBuffer]
       );

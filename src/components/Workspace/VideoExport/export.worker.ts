@@ -38,7 +38,7 @@ self.onmessage = async (e: MessageEvent<ExportWorkerRequest>) => {
       const safeTitle = payload.title.replace(/[^a-z0-9]/gi, '-').toLowerCase() || 'tacstem-export';
       const fileName = payload.options.customFileName || `${safeTitle}-${Date.now()}.mp4`;
 
-      self.postMessage(
+      (self.postMessage as any)(
         {
           type: 'complete',
           payload: {

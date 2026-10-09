@@ -55,8 +55,8 @@ const logout = () => {
     window.location.reload();
 };
 export default function App() {
-  const [user, setUser] = useState<any>(null);
-  const [userPlan, setUserPlan] = useState<'free' | 'pro'>('free');
+  const [user, setUser] = useState<any>({ uid: 'guest', displayName: 'Guest User' });
+  const [userPlan, setUserPlan] = useState<'free' | 'pro'>('pro');
   const [authLoading, setAuthLoading] = useState(true);
   const [view, setView] = useState<'home' | 'workspace'>('home');
   const [projects, setProjects] = useState<Project[]>([]);
@@ -235,79 +235,82 @@ export default function App() {
       // Request browser persistent storage for offline & PWA stability
       requestPersistentStorage().catch(console.warn);
 
+      // Ensure guest session flag is set
+      try {
+          localStorage.setItem('tacstemGuest', 'true');
+      } catch (e) {}
+
       // Immediately query all videos stored locally in IndexedDB
       getAllStoredVideoIds().then(storedIds => {
           setStoredVideoIds(new Set(storedIds));
       }).catch(console.error);
 
-      const guest = localStorage.getItem('tacstemGuest');
-      if (guest) {
-          setUser({ uid: 'guest', displayName: 'Guest User' });
-          setUserPlan('pro');
-          listProjectsLocally().then(loadedProjs => {
-              const formattedProjs = loadedProjs.map((p: any) => ({
-                 id: p.id,
-                 name: p.name,
-                 description: p.description,
-                 createdAt: p.createdAt || Date.now(),
-                 lastModified: p.lastModified || Date.now(),
-                 fileName: p.fileName,
-                 ownerId: p.ownerId,
-                 data: (() => {
-                     const d = p.data || {};
-                     if (d.playlists) {
-                         d.playlists = d.playlists.map((pl: any) => ({
-                             ...pl,
-                             events: pl.events.map((e: any) => typeof e === 'string' ? e : e.id).filter(Boolean)
-                         }));
-                     }
-                     return d;
-                 })()
-              }));
-              const sorted = formattedProjs.sort((a,b) => b.lastModified - a.lastModified);
-              setProjects(sorted);
+      // Load all stored projects unconditionally
+      listProjectsLocally().then(loadedProjs => {
+          const formattedProjs = loadedProjs.map((p: any) => ({
+             id: p.id,
+             name: p.name,
+             description: p.description,
+             createdAt: p.createdAt || Date.now(),
+             lastModified: p.lastModified || Date.now(),
+             fileName: p.fileName,
+             ownerId: p.ownerId || 'guest',
+             data: (() => {
+                 const d = p.data || {};
+                 if (d.playlists) {
+                     d.playlists = d.playlists.map((pl: any) => ({
+                         ...pl,
+                         events: pl.events.map((e: any) => typeof e === 'string' ? e : e.id).filter(Boolean)
+                     }));
+                 }
+                 return d;
+             })()
+          }));
+          const sorted = formattedProjs.sort((a,b) => b.lastModified - a.lastModified);
+          setProjects(sorted);
 
-              // Background eager pre-warm for the top 3 most recent projects for 0ms load
-              setTimeout(async () => {
-                  for (const proj of sorted.slice(0, 3)) {
-                      if (proj.fileName !== 'live') {
-                          try {
-                              const f = await loadVideoLocally(proj.id);
-                              if (f) {
-                                  const url = URL.createObjectURL(f);
-                                  setProjectBlobs(prev => {
-                                      if (prev.has(proj.id)) return prev;
-                                      return new Map(prev).set(proj.id, url);
-                                  });
-                                  setStoredVideoIds(prev => new Set(prev).add(proj.id));
-                              }
-                          } catch (e) {
-                              // ignore
+          // Background eager pre-warm for the top 3 most recent projects for 0ms load
+          setTimeout(async () => {
+              for (const proj of sorted.slice(0, 3)) {
+                  if (proj.fileName !== 'live') {
+                      try {
+                          const f = await loadVideoLocally(proj.id);
+                          if (f) {
+                              const url = URL.createObjectURL(f);
+                              setProjectBlobs(prev => {
+                                  if (prev.has(proj.id)) return prev;
+                                  return new Map(prev).set(proj.id, url);
+                              });
+                              setStoredVideoIds(prev => new Set(prev).add(proj.id));
                           }
+                      } catch (e) {
+                          // ignore
                       }
                   }
-              }, 300);
-          });
-          listBatchesLocally().then(loadedBatches => {
-              setBatches(loadedBatches || []);
-          });
-          listBoardProjectsLocally().then(loadedBoardProjs => {
-              if (loadedBoardProjs && loadedBoardProjs.length > 0) {
-                  setBoardProjects(loadedBoardProjs.sort((a,b) => b.lastModified - a.lastModified));
-              } else {
-                  const starter = createDefaultBoardProject('Tactical Board #1', 'Blank tactical workspace');
-                  saveBoardProjectLocally(starter);
-                  setBoardProjects([starter]);
               }
-          });
-      }
+          }, 300);
+      }).catch(console.error);
+
+      listBatchesLocally().then(loadedBatches => {
+          setBatches(loadedBatches || []);
+      }).catch(console.error);
+
+      listBoardProjectsLocally().then(loadedBoardProjs => {
+          if (loadedBoardProjs && loadedBoardProjs.length > 0) {
+              setBoardProjects(loadedBoardProjs.sort((a,b) => b.lastModified - a.lastModified));
+          } else {
+              const starter = createDefaultBoardProject('Tactical Board #1', 'Blank tactical workspace');
+              saveBoardProjectLocally(starter);
+              setBoardProjects([starter]);
+          }
+      }).catch(console.error);
+
       setAuthLoading(false);
   }, []);
 
   const createProject = (file: File, metadata?: { name?: string; description?: string }, fileHandle?: any) => {
       if (!user) {
-          setErrorMessage("Please sign in to create projects.");
-          return;
+          setUser({ uid: 'guest', displayName: 'Guest User' });
       }
       
       if (userPlan === 'free' && projects.length >= 3) {
